@@ -8,10 +8,10 @@
 #include <cmath>
 
 #include "headers.hpp"
-
+#define GLOBALSERIAL Serial
 
 const double degree_to_rotation = 1.0 / 360;
-
+double imu_acceleration = 0;
 struct Filter {
   int prev_time;
   float prev_filtered;
@@ -36,20 +36,31 @@ struct Filter {
 
     return ret;
   }
-} leg_filter(0.05), leg_speed_filter(0.05), rotary_speed_filter(0.05), height_speed_filter(0.05), no_filter(1);
+} leg_filter(0.05), leg_speed_filter(0.05), rotary_speed_filter(0.05), height_speed_filter(0.05);
 
 
 struct Encoder : public AS5600L{ 
-  float current_angle;
+  double current_angle;
+  double filtered_speed;
+  Filter speed_filter;
   
   Encoder(uint8_t address, TwoWire *wire)
     : AS5600L(address, wire)
     , current_angle(0)
+    , filtered_speed(0)
+    , speed_filter(Filter(0.05))
   {}
 
   void update_angle() {
     float angle = readAngle();
     current_angle = angle * AS5600_RAW_TO_DEGREES;
+  }
+
+  void update_speed(bool no_distance=false) {
+    const double degree_to_distance = (0.34 * 2 * 3.14159) / 360.0;
+    const double degree_to_rps = 1.0/360.0;
+    double current_angular_speed = getAngularSpeed();
+    filtered_speed = speed_filter.next_value(current_angular_speed) * (no_distance ? degree_to_rps : degree_to_distance);
   }
 };
 
@@ -74,12 +85,11 @@ struct Motor {
     int highpin = p1;
 
     if (backwards ^ reverse) { 
-      int temp = p0;
-      p0 = p1;
-      p1 = temp;
+      int temp = lowpin;
+      lowpin = highpin;
+      highpin = temp;
     } 
 
-    speed=abs(speed);
 
     if (speed < cutoff) { // If Very Low speed turn motor Off
       digitalWrite(lowpin, LOW);
@@ -92,7 +102,7 @@ struct Motor {
 
   void move_to_angle(float desired_angle) {
     static float proportional_factor = 23;  // 23 works well
-    static float integral_factor = 5;       // 5 works well   // Integral Factor gets divided later
+    static float integral_factor = 5 / 100000;       // 5 works well   // Integral Factor gets divided later
     static float derivative_factor = 2;    // 2 works well   // Derivative Factor doesn't use time
 
     static float integration_error = 0;
@@ -100,13 +110,27 @@ struct Motor {
     static float previous_time = micros();
 
     float current_time = micros();
-    float error = desired_angle - encoder->current_angle;
-
-    if (error > 180.0) {  // Change the error to the (shorter) complementary angle if it's above 180 or below -180
-      error = error - 360;
-    } else if (error < -180.0) {
-      error = error + 360;
+    float option1 = desired_angle;
+    float option2 = (desired_angle + 180.0);
+    if (option2 > 360) {
+      option2 -= 360;
     }
+
+    float error1 = (option1 - encoder->current_angle);
+    float error2 = (option2 - encoder->current_angle);
+    if (error1 > 180.0) {  // Change the error to the (shorter) complementary angle if it's above 180 or below -180
+      error1 = error1 - 360;
+    } else if (error1 < -180.0) {
+      error1 = error1 + 360;
+    }
+
+    if (error2 > 180.0) {  // Change the error to the (shorter) complementary angle if it's above 180 or below -180
+      error2 = error2 - 360;
+    } else if (error2 < -180.0) {
+      error2 = error2 + 360;
+    }
+
+    float error = abs(error1) < abs(error2) ? error1 : error2;
 
     integration_error += (error + previous_error) * (current_time - previous_time) / 2;
     float derivative_error = (error - previous_error);  // / (current_time - previous_time)     // Works better without time
@@ -114,12 +138,8 @@ struct Motor {
     previous_error = error;
     previous_time = current_time;
 
-    if (abs(error) < 0.3) {
-      pwm_value = 0;
-      drive_motor();
-    }
-    pwm_value = error * proportional_factor + integration_error * integral_factor / 100000 + derivative_error * derivative_factor;
-    drive_motor(160);
+    pwm_value = error * proportional_factor + integration_error * integral_factor + derivative_error * derivative_factor;
+    drive_motor();
   }
 };
 
@@ -127,17 +147,17 @@ struct Motor {
 Adafruit_LSM9DS1 imu = Adafruit_LSM9DS1(&Wire1, 0x6B);
 
 Encoder as5600_leg(0x36, &Wire);
-Encoder as5600_rotary(0x36, &Wire1);
-Encoder as5600_height(0x40, &Wire1);
+Encoder as5600_rotary(0x40, &Wire1);
+Encoder as5600_height(0x36, &Wire1);
 
-Motor m1 = {'1', 2, 3, &as5600_leg};
+Motor m1 = {'1', 2, 3, &as5600_leg, 0, 0, false};
 
 
 void IMU_init() {
   if (!imu.begin()) {
-    Serial.println("Can't find IMU");
+    GLOBALSERIAL.println("Can't find IMU");
   } else {
-    Serial.println("Found IMU");
+    GLOBALSERIAL.println("Found IMU");
     // ACCELRANGE 2, 4, 8, 16
     // ACCELDATARATE 10, 119, 476, 952
     imu.setupAccel(imu.LSM9DS1_ACCELRANGE_2G, imu.LSM9DS1_ACCELDATARATE_952HZ);
@@ -154,15 +174,15 @@ void motor_init(Motor m) {
   pinMode(m.p0, OUTPUT);
   pinMode(m.p1, OUTPUT);
   analogWriteResolution(12);
-  analogWriteFreq(100000);
+  //analogWriteFreq(100000);
   if (!m.encoder->detectMagnet()) {
-    Serial.println("Cant detect Magnet");
+    GLOBALSERIAL.println("Cant detect Magnet");
   }
   if (m.encoder->magnetTooWeak()) {
-    Serial.println("Magnet too weak");
+    GLOBALSERIAL.println("Magnet too weak");
   }
   if (m.encoder->magnetTooStrong()) {
-    Serial.println("Magnet too Strong");
+    GLOBALSERIAL.println("Magnet too Strong");
   }
 }
 
@@ -187,69 +207,57 @@ void get_acceleration(sensors_event_t a) {
   float x = a.acceleration.x;
   float y = a.acceleration.y;
   float z = a.acceleration.z;
-  Serial.print(0.2 + x * 19.62 / 19.6);
-  Serial.print(" ");
-  Serial.print(-0.15 + y * 19.62 / 19.7);
-  Serial.print(" ");
-  Serial.print(0.225 + z * 19.62 / 19.65);
-  Serial.println(" ");
+  GLOBALSERIAL.print(0.2 + x * 19.62 / 19.6);
+  GLOBALSERIAL.print(" ");
+  GLOBALSERIAL.print(-0.15 + y * 19.62 / 19.7);
+  GLOBALSERIAL.print(" ");
+  GLOBALSERIAL.print(0.225 + z * 19.62 / 19.65);
+  GLOBALSERIAL.println(" ");
 }
 
 
-void sensor_reading() {
+double current_acceleration() {
+  imu.readAccel();
   imu.read(); /* ask it to read in the data */
-
-  /* Get a new sensor event */
   sensors_event_t a, m, g, temp;
-  static float vx = 0;
-  static float vy = 0;
-  static float vz = 0;
   imu.getEvent(&a, &m, &g, &temp);
-
-  // Serial.print("Accel_X:"); Serial.print(a.acceleration.x); //Serial.print(" m/s^2");
-  // Serial.print("\tAccel_Y:"); Serial.print(a.acceleration.y);     //Serial.print(" m/s^2 ");
-  // Serial.print("\tAccel_Z:"); Serial.print(a.acceleration.z);     //Serial.println(" m/s^2 ");
-
-  // Serial.print("\tMag_X:"); Serial.print(m.magnetic.x);   //Serial.print(" uT");
-  // Serial.print("\tMag_Y:"); Serial.print(m.magnetic.y);     //Serial.print(" uT");
-  // Serial.print("\tMag_Z:"); Serial.println(m.magnetic.z);     //Serial.println(" uT");
-  Serial.print("T:1000 B:0 ");
-  Serial.print(vx);
-  Serial.print(" ");
-  Serial.print(vy);
-  Serial.print(" ");
-  Serial.print(vz);
-  Serial.print(" ");
-  Serial.print(a.acceleration.x);
-  Serial.print(" ");
-  Serial.print(a.acceleration.y);
-  Serial.print(" ");
-  Serial.print(a.acceleration.z);
-  Serial.println(" ");
-  //vx += a.acceleration.x;
-  //vy += a.acceleration.y;
-  //vz += a.acceleration.z;
-  //Serial.print("Accel:"); Serial.println(a.acceleration.x * a.acceleration.x + a.acceleration.y * a.acceleration.y + a.acceleration.z * a.acceleration.z);
-  // Serial.print("Gyro_X:"); Serial.print(g.gyro.x);   //Serial.print(" rad/s");
-  // Serial.print("\tGyro_Y:"); Serial.print(g.gyro.y);      //Serial.print(" rad/s");
-  // Serial.print("\tGyro_Z:"); Serial.print(g.gyro.z);      //Serial.println(" rad/s");
-
-  delay(1);
+  return a.acceleration.x * a.acceleration.x + a.acceleration.y * a.acceleration.y + a.acceleration.z * a.acceleration.z;
 }
 
 
 int get_touchdown(double vx, double vy, double theta) {
-  double v0 = pow((vx * vx + vy * vy), 1 / 2);
+  const double leg_length = 0.016;
   constexpr float candidate_tds[TDS] = TD_CANDIDATES;
   constexpr float lut[BETAS][TDS] = LUT;
-  return 40;
+
+  double takeoff_height = sin(theta) * leg_length;
+  double v0 = pow((vx * vx + vy * vy), 1 / 2);
+
+  double best_td = 0;
+  double best_difference = 100000000000;
+  for(int i=0; i<TDS ; i++) {
+    double evaluate_td = candidate_tds[i];
+    double final_height = sin(evaluate_td) * leg_length;
+    double final_y_v = -1.0 * sqrt(vy * vy + 2 * (final_height - takeoff_height));
+    double beta = final_y_v / vx;
+    int beta_index_lower = floor((beta - BETA_START) / BETA_DIFFERENCE);
+    int beta_index_upper = ceil((beta - BETA_START) / BETA_DIFFERENCE);
+    double calculated_velocity = (lut[beta_index_lower][i] + lut[beta_index_upper][i]) / 2;
+    double calculated_difference = abs(calculated_velocity - v0);
+    if(calculated_difference < best_difference) {
+      best_td = evaluate_td;
+      best_difference = calculated_difference;
+    }
+    
+  }
+
+  
+  return best_td * 57.2958;
 }
 
 
 void setup() {
   i2c_init();
-  //while(!Serial); // Wait for serial monitor to open
-  //Serial.println("-------");
   motor_init(m1);
   IMU_init();
   delay(2000);
@@ -257,26 +265,18 @@ void setup() {
   Serial1.setTX(12);
   Serial1.setRX(13);
   Serial1.begin(9600); //38400
-  Serial.begin(115200);
-}
-
-
-double get_speed(Encoder &encoder, Filter &f, bool no_distance=false) {
-  const double degree_to_distance = (0.34 * 2 * 3.14159) / 360.0;
-  double current_angular_speed = encoder.getAngularSpeed();
-  double filtered_speed = f.next_value(current_angular_speed) * (no_distance ? 1 : degree_to_distance);
-  return filtered_speed;
+  Serial.begin(115200); //15200
 }
 
 
 template <typename T>
 void print_diagnostics(T uart) {
-  // uart.print(">leg_speed:");
-  // uart.println(get_speed(as5600_leg, leg_speed_filter));
-  // uart.print(">rotary_speed:");
-  // uart.println(get_speed(as5600_rotary, rotary_speed_filter));
-  // uart.print(">height_speed:");
-  // uart.println(get_speed(as5600_height, height_speed_filter, true));
+  uart.print(">leg_speed:");
+  uart.println(as5600_leg.filtered_speed);
+  uart.print(">rotary_speed:");
+  uart.println(as5600_rotary.filtered_speed);
+  uart.print(">height_speed:");
+  uart.println(as5600_height.filtered_speed);
   uart.print(">current_height:");
   uart.println(as5600_height.current_angle);
   uart.print(">current_leg:");
@@ -284,7 +284,9 @@ void print_diagnostics(T uart) {
   uart.print(">current_rotary:");
   uart.println(as5600_rotary.current_angle);
   uart.print(">pwm:");
-  uart.println(m1.pwm_value);
+  uart.println(m1.pwm_value);  
+  uart.print(">imu_acceleration:");
+  uart.println(imu_acceleration);
 }
 
 float clip(float val, float max) {
@@ -299,10 +301,21 @@ float clip(float val, float max) {
 
 
 void controller() {
-  if (as5600_height.current_angle < 58) {
+  // static int flight_phase = 0;
+  // if(flight_phase == 0) {
+  //   if(imu_acceleration > 200) {
+  //     flight_phase = 0;
+  //   }
+  // } else {
+  //   if(imu_acceleration < 94) {
+  //     flight_phase = 1;
+  //   }
+  // }
+
+  if (as5600_height.current_angle > 297) {
     m1.move_to_angle(30);
   } else {
-    m1.pwm_value = 4095;
+    m1.pwm_value = 2000;
     m1.drive_motor();
   }  
 }
@@ -311,18 +324,20 @@ void update_sensor_readings(){
   as5600_leg.update_angle();
   as5600_rotary.update_angle();
   as5600_height.update_angle();
+  as5600_leg.update_speed(true);
+  as5600_rotary.update_speed();
+  as5600_height.update_speed();
+  //imu_acceleration = current_acceleration();
 }
 
 void loop() {
   static int counter = 0;
   update_sensor_readings();
-  controller();
-    print_diagnostics(Serial);
-
-  if (counter == 100) {
-    print_diagnostics(Serial);
+  controller(); 
+  const int max_count = 10;
+  if (counter == max_count) {
+    print_diagnostics(GLOBALSERIAL);
   }
-
-  counter = counter == 100 ? 0 : counter++;
-  delayMicroseconds(200);
+  counter = counter == max_count ? 0 : ++counter;
+  delayMicroseconds(100);
 }
